@@ -7,6 +7,9 @@
 #include <cstring>
 #include <unordered_map>
 #include <ul/fs/fs_Stdio.hpp>
+#include <vector>   // for icon override buffer
+#include <string>   // for config.ini parsing
+#include <sstream>  // for config.ini parsing
 
 using namespace ul::util::size;
 
@@ -32,6 +35,10 @@ namespace ul::system::app {
         constexpr double PerApplicationCacheUsageMb = PerApplicationCacheUsage / 1024.0f / 1024.0f;
 
         constexpr size_t LoopQueryMaxRetryCount = 50;
+
+        // Max size we'll accept from sys-icon override files
+        constexpr size_t MaxOverrideIconSize   = 512_KB;
+        constexpr size_t MaxConfigIniSize      = 4096; // 4 KB is plenty for simple ini
 
         void LogCacheMemoryUsage() {
             const auto total_size = PerApplicationCacheUsage * g_ApplicationCache->size();
@@ -84,9 +91,150 @@ namespace ul::system::app {
             return rc;
         }
 
+        // -----------------------------
+        //  Small helpers for config.ini
+        // -----------------------------
+        std::string TrimString(const std::string &in) {
+            const char *ws = " \t\r\n";
+            const auto start = in.find_first_not_of(ws);
+            if(start == std::string::npos) {
+                return "";
+            }
+            const auto end = in.find_last_not_of(ws);
+            return in.substr(start, end - start + 1);
+        }
+
+        std::string ToLower(const std::string &in) {
+            std::string out = in;
+            std::transform(out.begin(), out.end(), out.begin(), [](unsigned char c) {
+                return static_cast<char>(std::tolower(c));
+            });
+            return out;
+        }
+
+        void CopyOverrideField(char *dst, size_t dst_size, const std::string &value) {
+            if(dst == nullptr || dst_size == 0) {
+                return;
+            }
+            std::memset(dst, 0, dst_size);
+            const auto copy_len = std::min(dst_size - 1, value.size());
+            if(copy_len > 0) {
+                std::memcpy(dst, value.data(), copy_len);
+            }
+        }
+
+        // Apply overrides from:
+        //   sdmc:/atmosphere/contents/<program_id>/config.ini
+        // to NacpMetadata (name, author, version), if present.
+        bool ApplyConfigOverrides(const u64 app_id, smi::sf::NacpMetadata &meta) {
+            const auto program_id_str = util::FormatProgramId(app_id);
+            const auto override_dir   = fs::JoinPath("sdmc:/atmosphere/contents", program_id_str);
+            const auto ini_path       = fs::JoinPath(override_dir, "config.ini");
+
+            std::vector<char> buf;
+            buf.resize(MaxConfigIniSize + 1);
+            size_t read_size = 0;
+
+            if(!fs::ReadAllFile(ini_path, buf.data(), MaxConfigIniSize, read_size)) {
+                // No config.ini -> no overrides
+                return false;
+            }
+
+            buf[read_size] = '\0';
+            std::string content(buf.data(), read_size);
+            std::stringstream ss(content);
+            std::string line;
+
+            std::string name_override;
+            std::string author_override;
+            std::string version_override;
+
+            while(std::getline(ss, line)) {
+                line = TrimString(line);
+                if(line.empty()) {
+                    continue;
+                }
+                // Skip comments and section headers
+                if(line[0] == '#' || line[0] == ';' || line[0] == '[') {
+                    continue;
+                }
+
+                const auto eq_pos = line.find('=');
+                if(eq_pos == std::string::npos) {
+                    continue;
+                }
+
+                auto key   = TrimString(line.substr(0, eq_pos));
+                auto value = TrimString(line.substr(eq_pos + 1));
+
+                key = ToLower(key);
+
+                if(key == "name") {
+                    name_override = value;
+                }
+                else if(key == "author") {
+                    author_override = value;
+                }
+                else if(key == "version") {
+                    version_override = value;
+                }
+            }
+
+            bool applied = false;
+
+            if(!name_override.empty()) {
+                CopyOverrideField(meta.name, sizeof(meta.name), name_override);
+                applied = true;
+            }
+            if(!author_override.empty()) {
+                CopyOverrideField(meta.author, sizeof(meta.author), author_override);
+                applied = true;
+            }
+            if(!version_override.empty()) {
+                CopyOverrideField(meta.display_version, sizeof(meta.display_version), version_override);
+                applied = true;
+            }
+
+            if(applied) {
+                UL_LOG_INFO("[ApplicationControlCache] Applied config.ini overrides for application ID 0x%016lX", app_id);
+            } else {
+                UL_LOG_INFO("[ApplicationControlCache] config.ini found but no valid overrides for application ID 0x%016lX", app_id);
+            }
+
+            return applied;
+        }
+
+        // ===========================
+        //  sys-icon integration here
+        // ===========================
         bool CacheApplicationIcon(const u64 app_id, const u8 *icon_buf, const size_t icon_buf_size) {
-            const auto path = fs::JoinPath(ApplicationCachePath, util::FormatProgramId(app_id) + ".jpg");
-            return fs::WriteFile(path, icon_buf, icon_buf_size, true);
+            const auto program_id_str = util::FormatProgramId(app_id);
+            const auto cache_path     = fs::JoinPath(ApplicationCachePath, program_id_str + ".jpg");
+
+            /*
+             * sys-icon override:
+             *
+             * If an override icon exists at:
+             *   sdmc:/atmosphere/contents/<program_id>/icon.jpg
+             *
+             * we read that file and cache *it* instead of the NS icon.
+             * This lets your sysmodule control uLaunch icons the same way
+             * it does for qlaunch, without touching UI code.
+             */
+            const auto override_dir  = fs::JoinPath("sdmc:/atmosphere/contents", program_id_str);
+            const auto override_path = fs::JoinPath(override_dir, "icon.jpg");
+
+            std::vector<u8> override_buf;
+            override_buf.resize(MaxOverrideIconSize);
+            size_t override_size = 0;
+
+            if(fs::ReadAllFile(override_path, override_buf.data(), override_buf.size(), override_size)) {
+                UL_LOG_INFO("[ApplicationControlCache] Using sys-icon override for application ID 0x%016lX (icon size: %zu bytes)", app_id, override_size);
+                return fs::WriteFile(cache_path, override_buf.data(), override_size, true);
+            }
+
+            // Fallback: original uLaunch behavior
+            return fs::WriteFile(cache_path, icon_buf, icon_buf_size, true);
         }
 
         bool LoadApplicationIconCache(const u64 app_id, u8 *out_icon_buf, const size_t icon_buf_size, size_t &out_actual_icon_size) {
@@ -153,6 +301,9 @@ namespace ul::system::app {
                             memcpy(meta.name, langentry->name, sizeof(meta.name));
                             memcpy(meta.author, langentry->author, sizeof(meta.author));
                             memcpy(meta.display_version, control_data->nacp.display_version, sizeof(meta.display_version));
+
+                            // Apply config.ini overrides (if present)
+                            ApplyConfigOverrides(app_id, meta);
 
                             // Populate nxtc cache
                             if(!CacheApplicationNacpMetadata(app_id, meta)) {
@@ -298,3 +449,4 @@ namespace ul::system::app {
     }
 
 }
+
